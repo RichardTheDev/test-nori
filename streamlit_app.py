@@ -13,7 +13,7 @@ BASE_URL = "https://timestamp.dhimyotis.com/api/v1/"
 
 st.set_page_config(page_title="Horodatage Certigna d'images", layout="centered")
 
-st.title("Horodatage d’images avec Certigna")
+st.title("Horodatage d’images avec Certignaa")
 st.markdown(
     """
 Cette interface envoie vos données à l’API **Certigna Horodatage** via HTTPS en utilisant 
