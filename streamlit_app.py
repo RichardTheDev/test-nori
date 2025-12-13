@@ -4,8 +4,11 @@ import hashlib
 import base64
 from io import BytesIO
 from PIL import Image
+import subprocess
+import tempfile
+import os
 
-# URL de l'API Certigna (doc PDF)
+# URL de l'API Certigna
 BASE_URL = "https://timestamp.dhimyotis.com/api/v1/"
 
 st.set_page_config(page_title="Horodatage Certigna d'images", layout="centered")
@@ -43,10 +46,9 @@ uploaded_file = st.file_uploader(
     "Déposez une image (PNG, JPG, etc.)", type=["png", "jpg", "jpeg", "tiff", "bmp", "gif"]
 )
 
-algo = "SHA256"  # on fixe SHA-256 (supporté par l’API)  [oai_citation:2‡API_Service_Horodatage_Certigna_2024 (1) 3.pdf](sediment://file_0000000053247243b39141f74aa493f4)
+algo = "SHA256"  # SHA-256
 
 def compute_hash(file_bytes: bytes, algorithm: str = "SHA256") -> str:
-    """Calcule le hash hexadécimal du fichier."""
     if algorithm.upper() == "SHA256":
         return hashlib.sha256(file_bytes).hexdigest().upper()
     elif algorithm.upper() == "SHA384":
@@ -56,66 +58,102 @@ def compute_hash(file_bytes: bytes, algorithm: str = "SHA256") -> str:
     else:
         raise ValueError("Algorithme non supporté par cette interface.")
 
+def decode_tsr_with_openssl(tsr_bytes: bytes) -> str:
+    """
+    Décode un token TSA (.tsr) via openssl ts -reply -text
+    (si openssl n'est pas installé, on retourne un message clair)
+    """
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tsr") as f:
+            f.write(tsr_bytes)
+            tsr_path = f.name
 
-def timestamp_hash(hashed_message: str, algorithm: str, username: str, password: str) -> bytes:
+        result = subprocess.run(
+            ["openssl", "ts", "-reply", "-in", tsr_path, "-text"],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            return f"[OpenSSL ERROR]\n{result.stderr}"
+
+        return result.stdout
+    except FileNotFoundError:
+        return "[OpenSSL] Commande 'openssl' introuvable sur la machine."
+    except Exception as e:
+        return f"[OpenSSL] Erreur pendant le décodage: {e}"
+    finally:
+        try:
+            if "tsr_path" in locals() and os.path.exists(tsr_path):
+                os.remove(tsr_path)
+        except Exception:
+            pass
+
+def print_certigna_response(resp: requests.Response):
     """
-    Appelle l'API Certigna pour horodater un hash.
-    Envoie une requête x-www-form-urlencoded comme indiqué dans la doc.  [oai_citation:3‡API_Service_Horodatage_Certigna_2024 (1) 3.pdf](sediment://file_0000000053247243b39141f74aa493f4)
+    Affiche 'tout' ce que l'on peut afficher côté client :
+    status, headers, content-type, taille, body texte (si lisible), body base64.
     """
+    st.subheader("📡 Réponse Certigna (brute)")
+
+    st.markdown("**Status code**")
+    st.code(str(resp.status_code), language="text")
+
+    st.markdown("**Headers**")
+    st.json(dict(resp.headers))
+
+    st.markdown("**Content-Type**")
+    st.code(resp.headers.get("Content-Type", ""), language="text")
+
+    st.markdown("**Body size (bytes)**")
+    st.code(str(len(resp.content)), language="text")
+
+    # Tentative d'affichage texte (si réponse textuelle)
+    st.markdown("**Body (texte si décodable)**")
+    try:
+        txt = resp.content.decode("utf-8", errors="strict")
+        st.text_area("Body texte", txt, height=140)
+    except Exception:
+        st.info("Body non UTF-8 (binaire) — normal pour TSR / PDF.")
+
+    st.markdown("**Body (Base64)**")
+    st.text_area(
+        "Body base64",
+        base64.b64encode(resp.content).decode("ascii"),
+        height=180
+    )
+
+def timestamp_hash(hashed_message: str, algorithm: str, username: str, password: str) -> requests.Response:
     data = {
-        "certReq": "true",          # on demande l'inclusion du certificat de l’UH
-        "hashAlgorithm": algorithm, # SHA256 / SHA384 / SHA512
+        "certReq": "true",
+        "hashAlgorithm": algorithm,
         "hashedMessage": hashed_message,
     }
 
-    response = requests.post(
+    resp = requests.post(
         BASE_URL,
         data=data,
-        auth=(username, password),  # Basic Auth
+        auth=(username, password),
         timeout=30,
     )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Erreur API Certigna (hash) : {response.status_code} - {response.text}"
-        )
-
-    # Contenu de type application/timestamp-reply (jeton .tsr)  [oai_citation:4‡API_Service_Horodatage_Certigna_2024 (1) 3.pdf](sediment://file_0000000053247243b39141f74aa493f4)
-    return response.content
-
+    return resp
 
 def image_to_pdf_bytes(image_bytes: bytes) -> bytes:
-    """Convertit une image en PDF (une page) en mémoire."""
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
     buf = BytesIO()
     image.save(buf, format="PDF")
     return buf.getvalue()
 
+def timestamp_pdf(pdf_bytes: bytes, username: str, password: str) -> requests.Response:
+    files = {"file": ("document.pdf", pdf_bytes, "application/pdf")}
 
-def timestamp_pdf(pdf_bytes: bytes, username: str, password: str) -> bytes:
-    """
-    Appelle l'API Certigna pour horodater un PDF.
-    Envoie un multipart/form-data avec le champ 'file', comme dans l’exemple curl.  [oai_citation:5‡API_Service_Horodatage_Certigna_2024 (1) 3.pdf](sediment://file_0000000053247243b39141f74aa493f4)
-    """
-    files = {
-        "file": ("document.pdf", pdf_bytes, "application/pdf")
-    }
-
-    response = requests.post(
+    resp = requests.post(
         BASE_URL,
         files=files,
         auth=(username, password),
         timeout=60,
     )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Erreur API Certigna (PDF) : {response.status_code} - {response.text}"
-        )
-
-    # Contenu : le PDF horodaté (application/pdf)  [oai_citation:6‡API_Service_Horodatage_Certigna_2024 (1) 3.pdf](sediment://file_0000000053247243b39141f74aa493f4)
-    return response.content
-
+    return resp
 
 st.write("---")
 
@@ -138,38 +176,28 @@ if st.button("Horodater l’image", disabled=not uploaded_file or not username o
                 st.code(hashed, language="text")
 
                 st.subheader("2. Envoi à l’API Certigna (horodatage du hash)")
-                token_bytes = timestamp_hash(hashed, algo, username, password)
+                resp = timestamp_hash(hashed, algo, username, password)
 
+                # Affiche TOUT ce que Certigna renvoie côté HTTP
+                print_certigna_response(resp)
+
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Erreur API Certigna (hash) : {resp.status_code} - {resp.text}")
+
+                token_bytes = resp.content
                 st.success("Horodatage réussi – jeton d’horodatage reçu ✅")
 
                 st.download_button(
                     label="📥 Télécharger le jeton d’horodatage (.tsr)",
                     data=token_bytes,
                     file_name=f"{uploaded_file.name}.tsr",
-                    mime="application/timestamp-reply",
+                    mime=resp.headers.get("Content-Type", "application/timestamp-reply"),
                 )
 
-                st.subheader("Jeton encodé en Base64 (pour archivage / logs)")
-                st.text_area(
-                    "Jeton (.tsr) encodé en Base64",
-                    value=base64.b64encode(token_bytes).decode("ascii"),
-                    height=150,
-                )
-
-                st.subheader("Vérifier le jeton avec OpenSSL (optionnel)")
-                st.markdown(
-                    """
-                    Exemple de commande (si vous avez `openssl` installé) :
-
-                    ```bash
-                    # Vérifier que le jeton correspond bien au fichier original
-                    openssl ts -verify \\
-                        -CAfile trusted_certs.pem \\
-                        -data IMAGE_ORIGINALE.ext \\
-                        -in JETON.tsr -token_in
-                    ```
-                    """
-                )
+                # Décodage OpenSSL (infos internes du token)
+                st.subheader("🔎 Jeton TSA décodé (OpenSSL)")
+                decoded = decode_tsr_with_openssl(token_bytes)
+                st.text_area("Décodage OpenSSL", decoded, height=380)
 
             else:
                 # --- Horodatage via PDF ---
@@ -178,22 +206,29 @@ if st.button("Horodater l’image", disabled=not uploaded_file or not username o
                 st.write(f"PDF généré en mémoire – taille : {len(pdf_bytes)} octets")
 
                 st.subheader("2. Envoi à l’API Certigna (PDF à horodater)")
-                stamped_pdf_bytes = timestamp_pdf(pdf_bytes, username, password)
+                resp = timestamp_pdf(pdf_bytes, username, password)
 
+                # Affiche TOUT ce que Certigna renvoie côté HTTP
+                print_certigna_response(resp)
+
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Erreur API Certigna (PDF) : {resp.status_code} - {resp.text}")
+
+                stamped_pdf_bytes = resp.content
                 st.success("Horodatage réussi – PDF horodaté reçu ✅")
 
                 st.download_button(
                     label="📥 Télécharger le PDF horodaté",
                     data=stamped_pdf_bytes,
                     file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_horodate.pdf",
-                    mime="application/pdf",
+                    mime=resp.headers.get("Content-Type", "application/pdf"),
                 )
 
                 st.markdown(
                     """
                     Ouvrez ce PDF dans **Adobe Acrobat Reader** ou un autre lecteur supportant
                     les signatures / tampons temporels pour visualiser les informations
-                    de certification de l’horodatage.
+                    de certification.
                     """
                 )
 
